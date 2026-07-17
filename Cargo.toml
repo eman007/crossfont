@@ -39,4 +39,4 @@ objc2-foundation = { version = "0.2.2", features = [
 
 [target.'cfg(windows)'.dependencies]
 dwrote = { version = "0.11" }
-winapi = { version = "0.3", features = ["impl-default"] }
+winapi = { version = "0.3", features = ["impl-default", "dwrite", "dwrite_1", "dwrite_2", "d2d1", "dcommon", "unknwnbase", "winerror"] }

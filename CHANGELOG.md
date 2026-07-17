@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Colored emoji rendering on Windows (DirectWrite `TranslateColorGlyphRun`)
+
 ### Fixed
 
 - Ignore colored SVG fonts in fontconfig backend

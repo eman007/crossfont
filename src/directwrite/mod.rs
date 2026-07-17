@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::ptr;
 
 use dwrote::{
     FontCollection, FontFace, FontFallback, FontStretch, FontStyle, FontWeight, GlyphOffset,
@@ -11,8 +12,14 @@ use dwrote::{
 };
 
 use winapi::shared::ntdef::{HRESULT, LOCALE_NAME_MAX_LENGTH};
+use winapi::shared::winerror::SUCCEEDED;
 use winapi::um::dwrite;
+use winapi::um::dwrite_2::{
+    IDWriteColorGlyphRunEnumerator, IDWriteFactory2, DWRITE_COLOR_GLYPH_RUN,
+};
+use winapi::um::unknwnbase::IUnknown;
 use winapi::um::winnls::GetUserDefaultLocaleName;
+use winapi::Interface;
 
 use super::{
     BitmapBuffer, Error, FontDesc, FontKey, GlyphKey, Metrics, RasterizedGlyph, Size, Slant, Style,
@@ -22,6 +29,48 @@ use super::{
 /// DirectWrite uses 0 for missing glyph symbols.
 /// https://docs.microsoft.com/en-us/typography/opentype/spec/recom#glyph-0-the-notdef-glyph
 const MISSING_GLYPH_INDEX: u16 = 0;
+
+/// `TranslateColorGlyphRun` returns this when the glyph run has no color layers.
+const DWRITE_E_NOCOLOR: HRESULT = 0x8898_500Cu32 as HRESULT;
+
+/// Palette index used by DirectWrite to mean "use the current text (foreground) color".
+const FOREGROUND_PALETTE_INDEX: u16 = 0xFFFF;
+
+/// Owns an `IDWriteFactory2`, used to decompose color (emoji) glyph runs into their layers.
+///
+/// DirectWrite COM objects are only touched from the single rasterization thread, matching how
+/// `dwrote`'s own handles are used, so it is sound to move this between threads.
+struct ColorFactory(*mut IDWriteFactory2);
+
+unsafe impl Send for ColorFactory {}
+unsafe impl Sync for ColorFactory {}
+
+impl Drop for ColorFactory {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.0).Release();
+        }
+    }
+}
+
+impl ColorFactory {
+    fn new() -> Option<ColorFactory> {
+        unsafe {
+            let mut factory: *mut IDWriteFactory2 = ptr::null_mut();
+            let hr = dwrite::DWriteCreateFactory(
+                dwrite::DWRITE_FACTORY_TYPE_SHARED,
+                &IDWriteFactory2::uuidof(),
+                &mut factory as *mut *mut IDWriteFactory2 as *mut *mut IUnknown,
+            );
+
+            if SUCCEEDED(hr) && !factory.is_null() {
+                Some(ColorFactory(factory))
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// Cached DirectWrite font.
 struct Font {
@@ -37,6 +86,7 @@ pub struct DirectWriteRasterizer {
     keys: HashMap<FontDesc, FontKey>,
     available_fonts: FontCollection,
     fallback_sequence: Option<FontFallback>,
+    color_factory: Option<ColorFactory>,
 }
 
 impl DirectWriteRasterizer {
@@ -65,6 +115,16 @@ impl DirectWriteRasterizer {
             1.,
             dwrote::DWRITE_MEASURING_MODE_NATURAL,
         );
+
+        // Colored (emoji) glyphs are decomposed into per-color layers and composited into an
+        // RGBA bitmap. Non-color glyphs fall through to the greyscale ClearType path below.
+        if let Some(color_factory) = &self.color_factory {
+            if let Some(glyph) = unsafe {
+                rasterize_color_glyph(color_factory.0, &glyph_run, rendering_mode, character)
+            } {
+                return Ok(glyph);
+            }
+        }
 
         let glyph_analysis = GlyphRunAnalysis::create(
             &glyph_run,
@@ -141,6 +201,7 @@ impl crate::Rasterize for DirectWriteRasterizer {
             keys: HashMap::new(),
             available_fonts: FontCollection::system(),
             fallback_sequence: FontFallback::get_system_fallback(),
+            color_factory: ColorFactory::new(),
         })
     }
 
@@ -253,6 +314,173 @@ impl crate::Rasterize for DirectWriteRasterizer {
     fn kerning(&mut self, _left: GlyphKey, _right: GlyphKey) -> (f32, f32) {
         (0., 0.)
     }
+}
+
+/// Rasterize a color (emoji) glyph by decomposing it into DirectWrite color layers.
+///
+/// Returns `None` when the glyph has no color layers (`DWRITE_E_NOCOLOR`) or on any error, so the
+/// caller can fall back to the greyscale rendering path. On success it returns an RGBA bitmap with
+/// premultiplied alpha, matching the FreeType/CoreText color output.
+unsafe fn rasterize_color_glyph(
+    factory: *mut IDWriteFactory2,
+    glyph_run: &DWRITE_GLYPH_RUN,
+    rendering_mode: dwrite::DWRITE_RENDERING_MODE,
+    character: char,
+) -> Option<RasterizedGlyph> {
+    let mut enumerator: *mut IDWriteColorGlyphRunEnumerator = ptr::null_mut();
+    let hr = (*factory).TranslateColorGlyphRun(
+        0.0,
+        0.0,
+        glyph_run as *const DWRITE_GLYPH_RUN,
+        ptr::null(),
+        dwrote::DWRITE_MEASURING_MODE_NATURAL,
+        ptr::null(),
+        0,
+        &mut enumerator,
+    );
+
+    // Not a color glyph (or failed): let the caller render it in greyscale.
+    if hr == DWRITE_E_NOCOLOR || !SUCCEEDED(hr) || enumerator.is_null() {
+        return None;
+    }
+
+    struct Layer {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        // ClearType 3x1 coverage, 3 bytes per pixel.
+        coverage: Vec<u8>,
+        color: [f32; 4],
+    }
+
+    let mut layers: Vec<Layer> = Vec::new();
+
+    loop {
+        let mut has_run: i32 = 0;
+        if !SUCCEEDED((*enumerator).MoveNext(&mut has_run)) || has_run == 0 {
+            break;
+        }
+
+        let mut color_run: *const DWRITE_COLOR_GLYPH_RUN = ptr::null();
+        if !SUCCEEDED((*enumerator).GetCurrentRun(&mut color_run)) || color_run.is_null() {
+            break;
+        }
+        let run = &*color_run;
+
+        let analysis = match GlyphRunAnalysis::create(
+            &run.glyphRun,
+            1.,
+            None,
+            rendering_mode,
+            dwrote::DWRITE_MEASURING_MODE_NATURAL,
+            0.0,
+            0.0,
+        ) {
+            Ok(analysis) => analysis,
+            Err(_) => continue,
+        };
+
+        let bounds = match analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1) {
+            Ok(bounds) => bounds,
+            Err(_) => continue,
+        };
+        if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+            continue;
+        }
+
+        let coverage =
+            match analysis.create_alpha_texture(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1, bounds) {
+                Ok(coverage) => coverage,
+                Err(_) => continue,
+            };
+
+        // A palette index of 0xFFFF means "use the foreground color". Crossfont doesn't know the
+        // cell's text color here, so render such layers white (visible, uncommon for emoji).
+        let color = if run.paletteIndex == FOREGROUND_PALETTE_INDEX {
+            [1.0, 1.0, 1.0, 1.0]
+        } else {
+            [run.runColor.r, run.runColor.g, run.runColor.b, run.runColor.a]
+        };
+
+        layers.push(Layer {
+            left: bounds.left,
+            top: bounds.top,
+            right: bounds.right,
+            bottom: bounds.bottom,
+            coverage,
+            color,
+        });
+    }
+
+    (*enumerator).Release();
+
+    if layers.is_empty() {
+        return None;
+    }
+
+    // Union of all layer bounds is the final glyph bitmap.
+    let left = layers.iter().map(|l| l.left).min().unwrap();
+    let top = layers.iter().map(|l| l.top).min().unwrap();
+    let right = layers.iter().map(|l| l.right).max().unwrap();
+    let bottom = layers.iter().map(|l| l.bottom).max().unwrap();
+    let width = (right - left) as usize;
+    let height = (bottom - top) as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    // Premultiplied RGBA, transparent to start with.
+    let mut buffer = vec![0u8; width * height * 4];
+
+    // Layers come back in back-to-front paint order; composite source-over.
+    for layer in &layers {
+        let layer_width = (layer.right - layer.left) as usize;
+        let layer_height = (layer.bottom - layer.top) as usize;
+        let offset_x = (layer.left - left) as usize;
+        let offset_y = (layer.top - top) as usize;
+        let [cr, cg, cb, ca] = layer.color;
+
+        for y in 0..layer_height {
+            for x in 0..layer_width {
+                let cov_base = (y * layer_width + x) * 3;
+                let cov = (u32::from(layer.coverage[cov_base])
+                    + u32::from(layer.coverage[cov_base + 1])
+                    + u32::from(layer.coverage[cov_base + 2])) as f32
+                    / (3.0 * 255.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+
+                let src_a = ca * cov;
+                let src_r = cr * src_a;
+                let src_g = cg * src_a;
+                let src_b = cb * src_a;
+
+                let idx = ((offset_y + y) * width + (offset_x + x)) * 4;
+                let inv = 1.0 - src_a;
+                let dst_r = f32::from(buffer[idx]) / 255.0;
+                let dst_g = f32::from(buffer[idx + 1]) / 255.0;
+                let dst_b = f32::from(buffer[idx + 2]) / 255.0;
+                let dst_a = f32::from(buffer[idx + 3]) / 255.0;
+
+                buffer[idx] = ((src_r + dst_r * inv) * 255.0).round().clamp(0.0, 255.0) as u8;
+                buffer[idx + 1] = ((src_g + dst_g * inv) * 255.0).round().clamp(0.0, 255.0) as u8;
+                buffer[idx + 2] = ((src_b + dst_b * inv) * 255.0).round().clamp(0.0, 255.0) as u8;
+                buffer[idx + 3] = ((src_a + dst_a * inv) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    Some(RasterizedGlyph {
+        character,
+        width: right - left,
+        height: bottom - top,
+        top: -top,
+        left,
+        advance: (0, 0),
+        buffer: BitmapBuffer::Rgba(buffer),
+    })
 }
 
 impl From<dwrote::Font> for Font {
